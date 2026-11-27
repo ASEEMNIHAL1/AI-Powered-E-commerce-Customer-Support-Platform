@@ -1,130 +1,133 @@
 # System Architecture
 
-## High-Level Overview
+## Component and request-flow diagram
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                     Client Layer                         │
-│  ┌─────────────────────┐  ┌─────────────────────────┐   │
-│  │  Customer Portal    │  │  Support Dashboard      │   │
-│  │  (React + TS Vite)  │  │  (React + TS Vite)      │   │
-│  │  Port :5173         │  │  Port :5173 /support/*  │   │
-│  └──────────┬──────────┘  └──────────┬──────────────┘   │
-└─────────────┼──────────────────────-─┼─────────────────┘
-              │   HTTPS REST + JWT     │
-┌─────────────▼──────────────────────-▼─────────────────┐
-│                   FastAPI Backend                       │
-│                   Port :8000                            │
-│                                                         │
-│  ┌─────────────────────────────────────────────────┐   │
-│  │            Auth Middleware (JWT verify)          │   │
-│  └─────────────────────┬───────────────────────────┘   │
-│                         │                               │
-│  ┌─────────────────────▼───────────────────────────┐   │
-│  │            RBAC Guards                           │   │
-│  │  (get_current_user / get_current_staff)          │   │
-│  └──────────┬────────────────────────┬─────────────┘   │
-│             │                        │                  │
-│  ┌──────────▼─────────┐  ┌───────────▼──────────────┐  │
-│  │  Customer Routes   │  │  Support/Admin Routes    │  │
-│  │  /auth /orders     │  │  /support/tickets        │  │
-│  │  /tickets /refunds │  │  /support/escalations    │  │
-│  └──────────┬─────────┘  └───────────┬──────────────┘  │
-│             │                        │                  │
-│  ┌──────────▼────────────────────────▼──────────────┐   │
-│  │            Application Services Layer             │   │
-│  │  auth_service  order_service  ticket_service      │   │
-│  │  refund_service  escalation_service  audit        │   │
-│  │                                                   │   │
-│  │  ┌───────────────────────────────────────────┐   │   │
-│  │  │         AI Agent (support_agent.py)       │   │   │
-│  │  │  ┌─────────────────────────────────────┐  │   │   │
-│  │  │  │  AIProvider interface               │  │   │   │
-│  │  │  │  MockProvider | GeminiProvider      │  │   │   │
-│  │  │  └─────────────────────────────────────┘  │   │   │
-│  │  │  Tool Router (backend-enforced):           │   │   │
-│  │  │  get_order_details → order_service        │   │   │
-│  │  │  search_return_policy → TF-IDF RAG        │   │   │
-│  │  │  process_refund → refund_service          │   │   │
-│  │  │  escalate_to_human → escalation_service   │   │   │
-│  │  └───────────────────────────────────────────┘   │   │
-│  └──────────┬────────────────────────────────────────┘  │
-└─────────────┼──────────────────────────────────────────┘
-              │
-┌─────────────▼──────────────────────────────────────────┐
-│                   Data Layer                            │
-│  ┌────────────────────┐  ┌─────────────────────────┐   │
-│  │  PostgreSQL 16     │  │  Local Policy File       │   │
-│  │  (SQLAlchemy ORM)  │  │  return_policy.md        │   │
-│  │                    │  │  (TF-IDF indexed)        │   │
-│  │  - users           │  └─────────────────────────┘   │
-│  │  - orders          │                                 │
-│  │  - tickets         │  ┌─────────────────────────┐   │
-│  │  - messages        │  │  Audit Log Table         │   │
-│  │  - refunds         │  │  (all sensitive events)  │   │
-│  │  - escalations     │  └─────────────────────────┘   │
-│  │  - notes           │                                 │
-│  │  - audit_logs      │                                 │
-│  └────────────────────┘                                 │
-└─────────────────────────────────────────────────────────┘
+The following Mermaid diagram can be rendered directly by GitHub. It covers both the automated customer journey and the staff human-review path.
+
+```mermaid
+flowchart TB
+    subgraph UI["Frontend — React + TypeScript + Vite"]
+        C["Customer Portal"]
+        S["Support Dashboard"]
+    end
+
+    subgraph API["Backend — FastAPI"]
+        AUTH["JWT Authentication"]
+        RBAC["Role and customer-ownership checks"]
+        ROUTES["REST API Routers"]
+        SERVICES["Application Services"]
+        AGENT["AI Support Agent"]
+        PROVIDER["AI Provider Interface<br/>MockProvider / GeminiProvider"]
+        ROUTER["Backend Tool Router"]
+        ORDERTOOL["get_order_details"]
+        POLICYTOOL["search_return_policy"]
+        REFUNDTOOL["process_refund"]
+        ESCALATETOOL["escalate_to_human"]
+        VALIDATE["Refund Rules<br/>ownership · delivery · return window<br/>amount · idempotency · threshold"]
+        HUMAN["Human Review Gate"]
+    end
+
+    subgraph DATA["Persistence and retrieval"]
+        DB[("PostgreSQL 16<br/>users · orders · tickets · messages<br/>refunds · escalations · notes · audit_logs")]
+        POLICY[("return_policy.md<br/>TF-IDF retrieval")]
+    end
+
+    C -->|"HTTPS REST + JWT"| AUTH
+    S -->|"HTTPS REST + JWT"| AUTH
+    AUTH --> RBAC --> ROUTES --> SERVICES
+    SERVICES --> DB
+    ROUTES -->|"ticket chat"| AGENT
+    AGENT --> PROVIDER
+    PROVIDER --> ROUTER
+    ROUTER --> ORDERTOOL --> SERVICES
+    ROUTER --> POLICYTOOL --> POLICY
+    ROUTER --> REFUNDTOOL --> VALIDATE
+    VALIDATE -->|"eligible, within threshold"| DB
+    VALIDATE -->|"above threshold / review needed"| ESCALATETOOL
+    ESCALATETOOL --> HUMAN
+    HUMAN -->|"staff decision via dashboard"| S
+    S --> ROUTES
+    HUMAN --> SERVICES
+    SERVICES -->|"persist decision and audit event"| DB
 ```
 
-## Refund Request Flow
+## Application components
 
-```
-Customer sends "I want a refund" in chat
-        │
-        ▼
-Backend authenticates customer (JWT)
-        │
-        ▼
-AI Agent: identifies intent, checks for order ID
-        │
-   Missing order ID? ──YES──▶ Ask customer for order ID
-        │ NO
-        ▼
-AI calls: get_order_details(order_id)
-   Backend: ownership check ──FAIL──▶ 404 error
-        │ PASS
-        ▼
-AI calls: search_return_policy(category)
-   RAG: TF-IDF search over return_policy.md
-        │
-        ▼
-AI calls: process_refund(order_id, amount, reason)
-        │
-        ▼
-Backend refund_service validates:
-  1. Customer owns order
-  2. Order is delivered
-  3. Return window not expired
-  4. Amount ≤ order total
-  5. No existing active refund
-  6. Idempotency key check
-        │
-   Amount > ₹5000?
-   YES ──▶ Create ESCALATED refund + Escalation record
-              │
-              ▼
-         Staff reviews in dashboard
-         Approve/Reject/More Info
-   NO ──▶ Create PENDING refund record
-        │
-        ▼
-Persist messages, audit events
-Return result to customer
+| Component | Responsibility |
+|---|---|
+| Customer Portal | Registration/login, orders, support tickets, AI chat, refund status |
+| Support Dashboard | Staff ticket queue, ticket details, internal notes, escalation decisions |
+| FastAPI routers | HTTP boundary for authentication, orders, tickets, messages, refunds, and support actions |
+| JWT/RBAC dependencies | Authenticate users and enforce customer/staff permissions |
+| Application services | Implement ticket, order, refund, escalation, authentication, and audit behavior |
+| AI Support Agent | Uses provider abstraction and routes supported support tasks to backend tools |
+| Policy retrieval | Searches the local return policy document with TF-IDF |
+| PostgreSQL | Persists users, orders, tickets, messages, refunds, escalations, notes, and audit logs |
+| Human review | Staff examines escalated records and records the decision through protected support endpoints |
+
+## Refund request and human-review flow
+
+```mermaid
+flowchart TD
+    A["Customer asks for help in ticket chat"] --> B["JWT authentication and ticket ownership validation"]
+    B --> C["AI agent identifies intent and asks for missing details"]
+    C --> D["Backend order lookup and policy retrieval"]
+    D --> E["Refund service validates request"]
+    E --> F{"All refund rules satisfied?"}
+    F -->|"No"| G["Return a safe validation error"]
+    F -->|"Yes"| H{"Amount exceeds configured threshold?"}
+    H -->|"No"| I["Create pending refund record"]
+    H -->|"Yes"| J["Create escalated refund and escalation record"]
+    J --> K["Staff opens escalation queue"]
+    K --> L["Staff reviews evidence and records decision"]
+    L --> M["Update escalation/refund and audit log"]
+    I --> N["Persist response and conversation"]
+    M --> N
+    G --> O["Explain outcome to customer"]
+    N --> O
 ```
 
-## Security Layers
+The current configured default threshold is 500000 paise (₹5,000). The backend owns this rule; it is not trusted from a customer request or generated by the model. The code distinguishes the exact threshold from values above it.
 
-1. **Transport**: HTTPS in production
-2. **Authentication**: JWT Bearer token on every protected route
-3. **Authorization**: Role guards (`get_current_active_customer`, `get_current_staff`)
-4. **Object ownership**: All DB queries include `WHERE customer_id = auth_user.id`
-5. **Input validation**: Pydantic schemas on all request bodies
-6. **SQL injection**: SQLAlchemy ORM with parameterized queries
-7. **Prompt injection**: 
-   - System prompt never mixed with user content
-   - Customer identity from JWT, not from LLM-generated args
-   - Business rules enforced server-side regardless of LLM output
-8. **Audit trail**: All sensitive events logged to `audit_logs`
+## Existing high-level architecture (text view)
+
+```
+Customer Portal / Support Dashboard
+              |
+         REST + JWT
+              |
+     FastAPI Routers + RBAC
+              |
+       Application Services
+        /      |       \
+       /       |        \
+   PostgreSQL  AI Agent  Audit Log
+                 |
+            Tool Router
+           /    |     \
+       Orders Policy  Refund
+              Retrieval  |
+                        Escalation
+                            |
+                       Staff Review
+                            |
+                       Audit + DB
+```
+
+## Security layers
+
+1. **Transport:** use HTTPS in deployed environments.
+2. **Authentication:** JWT bearer token on protected routes.
+3. **Authorization:** customer-only and staff/admin role dependencies.
+4. **Object ownership:** customer resource lookups are scoped to the authenticated user.
+5. **Input validation:** Pydantic request schemas validate API input.
+6. **SQL access:** SQLAlchemy ORM queries.
+7. **AI safety boundary:** system instructions and user content are separated; customer identity and business rules are determined by backend context, not by model-generated claims.
+8. **Refund controls:** backend checks ownership, delivery state, return window, amount, duplicate/idempotency rules, and escalation threshold.
+9. **Auditability:** sensitive refund/escalation actions create audit records.
+
+## Notes and limitations
+
+- `AI_MOCK_MODE=true` is the deterministic default used in the recorded verification.
+- Gemini integration is available through the provider interface but requires a valid key and a separate live-provider verification.
+- Refunds are simulated application records. The project does not connect to a payment processor or transfer funds.
